@@ -105,9 +105,11 @@ class Aria2WebSocket:
             if (Path(file.dir) / file.name).is_file():
                 self.uploads[file.gid] = await self.drive.uploadFile(file)
             elif (Path(file.dir) / file.name).is_dir():
+                folderProgress = await self.api.invoker.reply("Initializing folder upload...")
+                del self.downloads[file.gid]
                 folderId = await self.drive.createFolder(file.name)
                 await self.drive.uploadFolder(
-                    Path(file.dir) / file.name, parent_id=folderId, msg=self.api.invoker)
+                    Path(file.dir) / file.name, parent_id=folderId, msg=folderProgress)
 
                 driveFolderLink = "https://drive.google.com/drive/folders/" + folderId
                 text = f"**GoogleDrive folderLink**: [{file.name}]({driveFolderLink})"
@@ -115,8 +117,8 @@ class Aria2WebSocket:
                     link = self.drive.index_link + "/" + parse.quote(file.name + "/")
                     text += f"\n\n__Shareable link__: [Here]({link})."
 
-                await self.api.invoker.reply(text)
-                del self.downloads[file.gid]
+                await folderProgress.reply(text)
+                await folderProgress.delete()
             if file.bittorrent:
                 self.log.info(f"Seeding: [gid: '{gid}']")
                 self.bot.loop.create_task(self._seedFile(file))

@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import pyrogram
@@ -28,14 +29,30 @@ class ConversationDispatcher(Base):
 
         return create(func)
 
-    def conversation(
+    @asynccontextmanager
+    async def conversation(
         self: "Bot",
         chat_id: Union[str, int],
         *,
         timeout: Optional[int] = 7,
         max_messages: Optional[int] = 7
-    ) -> Conversation:
-        return Conversation(self, chat_id, timeout, max_messages)
+    ) -> None:
+        conv = Conversation(self, chat_id, timeout, max_messages)
+        await conv.chat
+
+        chat_name = conv.chat.title if conv.chat.title else conv.chat.first_name
+        if conv.chat.id in self.CONVERSATION:
+            raise conv.Exist(f"Conversation with '{chat_name}' exist")
+
+        self.log.debug(f"Open conversation with '{chat_name}'")
+        self.CONVERSATION[conv.chat.id] = asyncio.Queue(max_messages)
+
+        try:
+            yield conv
+        finally:
+            self.log.debug(f"Close conversation with '{chat_name}'")
+            self.CONVERSATION[conv.chat.id].put_nowait(None)
+            del self.CONVERSATION[conv.chat.id]
 
     async def on_conversation(
         self: "Bot",

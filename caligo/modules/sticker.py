@@ -26,13 +26,10 @@ class StickerModule(module.Module):
     name: ClassVar[str] = "Sticker"
 
     db: AsyncIOMotorDatabase
-    lock: asyncio.Lock
-
     kang_db: AsyncIOMotorCollection
 
     async def on_load(self):
         self.db = self.bot.get_db("stickers")
-        self.lock = asyncio.Lock()
 
         check = await self.db.find_one({"_id": self.name})
         self.kang_db = check.get("pack_name") if check is not None else None
@@ -200,6 +197,7 @@ class StickerModule(module.Module):
 
         if not pack_name:
             ret = await self.cmd_createpack(ctx)
+            await self.on_load()
 
             return ret
 
@@ -259,16 +257,15 @@ class StickerModule(module.Module):
 
         emoji = ctx.args[1] if len(ctx.args) > 1 else "❓"
         pack_name = self.bot.user.username + f"_kangPack_VOL{num}"
-        async with self.lock:
-            await self.db.update_one(
-                {"_id": self.name},
-                {
-                    "$set": {
-                        f"pack_name.{num}": pack_name
-                    }
-                },
-                upsert=True
-            )
+        await self.db.update_one(
+            {"_id": self.name},
+            {
+                "$set": {
+                    f"pack_name.{num}": pack_name
+                }
+            },
+            upsert=True
+        )
 
         try:
             await self.bot.client.send(GetStickerSet(
