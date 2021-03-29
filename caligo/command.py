@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, List, Optional, Sequence, Union
 
 import pyrogram
 
@@ -68,16 +68,46 @@ class Command:
 class Context:
     bot: "Bot"
     msg: pyrogram.types.Message
-    cmd_length: int
+    segments: Sequence[str]
+    cmd_len: int
+    invoker: str
 
-    def __init__(self, bot: "Bot", msg: pyrogram.types.Message,
-                 cmd_len: int) -> None:
+    response: Optional[pyrogram.types.Message]
+    response_mode: Optional[str]
+
+    input: Optional[Union[str, None]]
+    args: Sequence[str]
+
+    def __init__(
+        self,
+        bot: "Bot",
+        msg: pyrogram.types.Message,
+        segments: Sequence[str],
+        cmd_len: int,
+    ) -> None:
         self.bot = bot
         self.msg = msg
+        self.segments = segments
         self.cmd_len = cmd_len
+        self.invoker = segments[0]
 
         self.response = None
         self.response_mode = None
+
+        self.input = self.msg.text[self.cmd_len:]
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "args":
+            return self._get_args()
+
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    # Argument segments
+    def _get_args(self) -> Sequence[str]:
+        self.args = self.segments[1:]
+        return self.args
 
     async def respond(
         self,
@@ -93,6 +123,7 @@ class Context:
         self.response = await self.bot.respond(
             msg or self.msg,
             text,
+            input_arg=self.input,
             mode=mode,
             redact=redact,
             response=self.response
@@ -101,3 +132,27 @@ class Context:
         )
         self.response_mode = mode
         return self.response
+
+    async def respond_multi(
+        self,
+        *args: Any,
+        mode: Optional[str] = None,
+        msg: Optional[pyrogram.types.Message] = None,
+        reuse_response: bool = False,
+        **kwargs: Any,
+    ) -> pyrogram.types.Message:
+        # First response is the same
+        if self.response:
+            # After that, force a reply to the previous response
+            if mode is None:
+                mode = "reply"
+
+            if msg is None:
+                msg = self.response
+
+            if reuse_response is None:
+                reuse_response = False
+
+        return await self.respond(
+            *args, mode=mode, msg=msg, reuse_response=reuse_response, **kwargs
+        )

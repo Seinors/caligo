@@ -12,7 +12,6 @@ RUN apk add --no-cache \
         musl-dev \
         gcc \
         g++ \
-        leveldb-dev \
         make \
         zlib-dev \
         tiff-dev \
@@ -34,26 +33,41 @@ WORKDIR /src
 COPY . .
 RUN pip install --upgrade pip
 RUN pip install wheel
+RUN pip install uvloop
 RUN pip install .
 
 
 # Package everything
 FROM python:3-alpine AS final
+# Update system first
+RUN apk update
+
 # Install optional native tools (for full functionality)
-RUN apk add --no-cache neofetch
+RUN apk add --no-cache \
+        curl \
+        neofetch \
+        git \
+        nss
 # Install native dependencies
 RUN apk add --no-cache \
-        aria2 \
-        curl \
         libffi \
-        leveldb \
-        zlib \
+        musl \
+        gcc \
+        g++ \
+        make \
         tiff \
         freetype \
         libpng \
         libjpeg-turbo \
         lcms2 \
-        libwebp
+        libwebp \
+        openssl \
+        zlib \
+        busybox \
+        sqlite \
+        libxml2 \
+        libssh2 \
+        ca-certificates
 
 # Create bot user
 RUN adduser -D caligo
@@ -65,7 +79,29 @@ COPY --from=go-build /go/bin/corrupter /usr/local/bin
 ENV PATH="/opt/venv/bin:$PATH"
 COPY --from=python-build /opt/venv /opt/venv
 
+# Tell system that we run on container
+ENV CONTAINER="True"
+
+# Clone the repo so update works
+RUN git clone https://github.com/adekmaulana/caligo /home/caligo
+RUN chmod +x /home/caligo/bot
+RUN cp /home/caligo/bot /usr/local/bin
+
+RUN mkdir -p /home/caligo/.cache/caligo/.certs
+
+# Initialize mkcert
+RUN curl -LJO https://github.com/FiloSottile/mkcert/releases/download/v1.4.3/mkcert-v1.4.3-linux-amd64
+RUN mv mkcert-v1.4.3-linux-amd64 /usr/local/bin/mkcert
+RUN chmod +x /usr/local/bin/mkcert
+
+RUN mkcert -install
+RUN mkcert -key-file /home/caligo/.cache/caligo/.certs/key.pem -cert-file /home/caligo/.cache/caligo/.certs/cert.pem localhost
+
+# Download aria with sftp and gzip support
+RUN curl -LJO https://techdro.id/techdroid/aria2-1.35.0-r3.apk
+RUN apk add --allow-untrusted --no-cache aria2-1.35.0-r3.apk
+
 # Set runtime settings
 USER caligo
 WORKDIR /home/caligo
-CMD ["caligo"]
+CMD ["bash", "bot"]

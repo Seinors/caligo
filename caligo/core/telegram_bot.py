@@ -1,12 +1,14 @@
+import asyncio
+import signal
 from typing import TYPE_CHECKING, Any, Optional
 
-import aria2p
 import pyrogram
-from pyrogram.filters import Filter
+from pyrogram import filters, Client
+from pyrogram.filters import Filter, create
 from pyrogram.handlers import DeletedMessagesHandler, MessageHandler, UserStatusHandler
 from pyrogram.handlers.handler import Handler
 
-from ..util import BotConfig, aria, silent
+from ..util import BotConfig, silent, time, tg
 from .base import Base
 
 if TYPE_CHECKING:
@@ -14,9 +16,9 @@ if TYPE_CHECKING:
 
 
 class TelegramBot(Base):
-    aria: aria2p.Client
-    client: pyrogram.Client
+    client: Client
     getConfig: BotConfig
+    is_running: bool
     prefix: str
     user: pyrogram.types.User
     uid: int
@@ -45,30 +47,51 @@ class TelegramBot(Base):
             mode = string_session
         else:
             mode = ":memory:"
-        self.client = pyrogram.Client(api_id=api_id,
-                                      api_hash=api_hash,
-                                      session_name=mode)
+        self.client = Client(api_id=api_id,
+                             api_hash=api_hash,
+                             session_name=mode)
 
     async def start(self: "Bot") -> None:
         self.log.info("Starting")
         await self.init_client()
 
-        # Load modules
-        self.load_all_modules()
-        await self.dispatch_event("load")
-        self.loaded = True
+        # Load prefix
+        db = self.get_db("core")
+        try:
+            self.prefix = (await db.find_one({"_id": "Core"}))["prefix"]
+        except TypeError:
+            lock = asyncio.Lock()
+            self.prefix = "."  # Default is '.'-dot you can change later
 
-        # iter first because can't use *.keys()
-        commands = []
-        for cmd in self.commands.keys():
-            commands.append(cmd)
+            async with lock:
+                await db.find_one_and_update(
+                    {"_id": "Core"},
+                    {
+                        "$set": {"prefix": self.prefix}
+                    },
+                    upsert=True
+                )
 
         self.client.add_handler(
             MessageHandler(
                 self.on_command,
-                filters=(pyrogram.filters.command(
-                    commands, prefixes=".", case_sensitive=True) &
-                         pyrogram.filters.me & pyrogram.filters.outgoing)), 0)
+                filters=(
+                    self.command_predicate() &
+                    filters.me &
+                    filters.outgoing
+                )
+            ), 0)
+
+        self.client.add_handler(
+            MessageHandler(
+                self.on_conversation,
+                filters=self.conversation_predicate()
+            ), 0)
+
+        # Load modules
+        self.load_all_modules()
+        await self.dispatch_event("load")
+        self.loaded = True
 
         async with silent():
             await self.client.start()
@@ -79,42 +102,51 @@ class TelegramBot(Base):
         self.user = user
         self.uid = user.id
 
-        await self.dispatch_event("start")
+        self.start_time_us = time.usec()
+        await self.dispatch_event("start", self.start_time_us)
 
         self.log.info("Bot is ready")
 
-        await self.dispatch_event("aria", await aria.initialize(self.http))
-        self.aria = aria2p.API(
-            aria2p.Client(host="http://localhost", port=6800, secret=""))
-
         await self.dispatch_event("started")
+
+    async def idle(self: "Bot") -> None:
+        def signal_handler(_, __):
+
+            self.log.info(f"Stop signal received ({_}).")
+            self.is_running = False
+
+        for name in (signal.SIGINT, signal.SIGTERM, signal.SIGABRT):
+            signal.signal(name, signal_handler)
+
+        self.is_running = True
+
+        while self.is_running:
+            await asyncio.sleep(1)
 
     async def run(self: "Bot") -> None:
         try:
             await self.start()
 
             self.log.info("Idling...")
-            await pyrogram.idle()
+            await self.idle()
         finally:
-            await self.stop()
+            if not self.stop_manual:
+                await self.stop()
 
     def update_module_event(self: "Bot",
                             name: str,
                             handler_type: Handler,
-                            filters: Optional[Filter] = None,
+                            filt: Optional[Filter] = None,
                             group: int = 0) -> None:
         if name in self.listeners:
             # Add if there ARE listeners and it's NOT already registered
             if name not in self._mevent_handlers:
 
-                async def update_handler(client, event) -> None:
-                    if (type(event) is not pyrogram.types.list.List and
-                            event.command and event.from_user.id == self.uid):
-                        return
+                async def update_handler(_, event) -> None:
                     await self.dispatch_event(name, event)
 
-                handler_info = self.client.add_handler(
-                    handler_type(update_handler, filters), group)
+                handler_info = self.client.add_handler(  # skipcq: PYL-E1111
+                    handler_type(update_handler, filt), group)
                 self._mevent_handlers[name] = handler_info
         elif name in self._mevent_handlers:
             # Remove if there are NO listeners and it's ALREADY registered
@@ -123,40 +155,84 @@ class TelegramBot(Base):
 
     def update_module_events(self: "Bot") -> None:
         self.update_module_event("message", MessageHandler,
-                                 pyrogram.filters.all, 1)
+                                 filters.all & ~filters.edited &
+                                 ~self.command_predicate() &
+                                 ~TelegramBot.chat_action(), 3)
+        self.update_module_event("message_edit", MessageHandler,
+                                 filters.edited, 3)
         self.update_module_event("message_delete", DeletedMessagesHandler,
-                                 pyrogram.filters.all, 2)
-        self.update_module_event("user_update", UserStatusHandler, 3)
+                                 filters.all, 3)
+        self.update_module_event("chat_action", MessageHandler,
+                                 TelegramBot.chat_action(), 3)
+        self.update_module_event("user_update", UserStatusHandler,
+                                 filters.all, 5)
 
-    def redact_message(self, text: str) -> str:
+    @property
+    def events_activated(self: "Bot") -> int:
+        return len(self._mevent_handlers)
+
+    def redact_message(self: "Bot", text: str) -> str:
+        redacted = "[REDACTED]"
+
         api_id = self.getConfig.api_hash
         api_hash = self.getConfig.api_hash
         db_uri = self.getConfig.db_uri
+        gdrive_secret = self.getConfig.gdrive_secret
         string_session = self.getConfig.string_session
 
         if api_id in text:
-            text = text.replace(api_id, "[REDACTED]")
+            text = text.replace(api_id, redacted)
         if api_hash in text:
-            text = text.replace(api_hash, "[REDACTED]")
+            text = text.replace(api_hash, redacted)
         if db_uri in text:
-            text = text.replace(db_uri, "[REDACTED]")
+            text = text.replace(db_uri, redacted)
+        if gdrive_secret is not None:
+            client_id = gdrive_secret["installed"].get("client_id")
+            client_secret = gdrive_secret["installed"].get("client_secret")
+
+            if client_id in text:
+                text = text.replace(client_id, redacted)
+            if client_secret in text:
+                text = text.replace(client_secret, redacted)
         if string_session in text:
-            text = text.replace(string_session, "[REDACTED]")
+            text = text.replace(string_session, redacted)
 
         return text
+
+    @staticmethod
+    def chat_action() -> Filter:
+        async def func(__, ___, chat: pyrogram.types.Message):
+            return bool(chat.new_chat_members or chat.left_chat_member)
+
+        return create(func)
 
     async def respond(
         self: "Bot",
         msg: pyrogram.types.Message,
         text: Optional[str] = None,
         *,
+        input_arg: Optional[str] = None,
         mode: Optional[str] = None,
         redact: Optional[bool] = True,
         response: Optional[pyrogram.types.Message] = None,
         **kwargs: Any,
     ) -> pyrogram.types.Message:
         if text is not None:
-            text = self.redact_message(text)
+
+            if redact:
+                text = self.redact_message(text)
+
+            # send as file if text > 4096
+            if len(text) > tg.MESSAGE_CHAR_LIMIT:
+                await msg.edit("Sending output as a file.")
+                response = await tg.send_as_document(
+                    text,
+                    msg,
+                    input_arg
+                )
+
+                await msg.delete()
+                return response
 
         # Default to disabling link previews in responses
         if "disable_web_page_preview" not in kwargs:
@@ -183,9 +259,13 @@ class TelegramBot(Base):
                 return await response.edit(text=text, **kwargs)
 
             # Repost since we haven't done so yet
-            response = await msg.reply(text,
-                                       reply_to=msg.reply_to_msg_id,
-                                       **kwargs)
+            if kwargs.get("document"):
+                del kwargs["disable_web_page_preview"]
+                response = await msg.reply_document(**kwargs)
+            else:
+                response = await msg.reply(text,
+                                           reply_to_message_id=msg.message_id,
+                                           **kwargs)
             await msg.delete()
             return response
 
