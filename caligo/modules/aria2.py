@@ -1,5 +1,5 @@
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, ClassVar, Dict, List, Tuple, Union
 from urllib import parse
@@ -7,7 +7,6 @@ from urllib import parse
 import aioaria2
 import pyrogram
 from googleapiclient.http import MediaFileUpload
-from pyrogram.errors import MessageEmpty, MessageNotModified
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -195,25 +194,25 @@ class Aria2WebSocket:
         return self.api.cancelled
 
     async def _updateProgress(self) -> None:
+        last_update_time = None
         while not self.api.stopping:
             if len(self.downloads) >= 1:
                 progress, completed = await self._checkProgress()
+                now = datetime.now()
                 async for gid in completed:
                     del self.downloads[gid]
 
-                try:
+                if last_update_time is None or (now - last_update_time
+                                                ).total_seconds() >= 5 and (
+                        progress != ""):
                     await self.api.invoker.edit(progress)
-                except (MessageNotModified, MessageEmpty):
-                    await asyncio.sleep(1)
-                else:
-                    await asyncio.sleep(5)
-                finally:
-                    continue
+
+                    last_update_time = now
             elif len(self.downloads) == 0 and self.api.invoker is not None:
                 await self.api.invoker.delete()
                 self.api.invoker = None
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
 
     async def _seedFile(self, file: util.aria2.Download) -> None:
         port = util.aria2.get_free_port()
@@ -293,7 +292,14 @@ class Aria2(module.Module):
 
     async def on_load(self) -> None:
         self.cancelled = False
-        self.client = await Aria2WebSocket.init(self)
+
+        try:
+            self.client = await Aria2WebSocket.init(self)
+        except FileNotFoundError:
+            self.log.warning("Aria2 package is not installed.")
+            self.bot.unload_module(self)
+            return
+
         self.invoker = None
         self.stopping = False
 
